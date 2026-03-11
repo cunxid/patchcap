@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Summarize OptiTrack-style .tak motion-capture files.
+"""Extract metadata from OptiTrack-style .tak motion-capture files.
 
-This script reads .tak files stored as Compound File Binary (OLE/CFB) containers
-and prints a compact summary of stream contents and key metadata.
+This script reads .tak files stored as Compound File Binary (OLE/CFB) containers,
+parses metadata properties from MetaData.dat, prints metadata-only output, and
+writes the same report to a text file for downstream analysis.
 """
 
 from __future__ import annotations
 
 import argparse
-import math
 import re
 import struct
 from dataclasses import dataclass
@@ -31,7 +31,7 @@ class DirectoryEntry:
 
 
 class CompoundFile:
-    """Minimal Compound File Binary (CFB/OLE) reader for stream enumeration."""
+    """Minimal Compound File Binary (CFB/OLE) reader for stream extraction."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -40,17 +40,14 @@ class CompoundFile:
 
         self.minor_version = struct.unpack_from("<H", self.data, 0x18)[0]
         self.major_version = struct.unpack_from("<H", self.data, 0x1A)[0]
-        self.byte_order = struct.unpack_from("<H", self.data, 0x1C)[0]
         self.sector_shift = struct.unpack_from("<H", self.data, 0x1E)[0]
         self.mini_sector_shift = struct.unpack_from("<H", self.data, 0x20)[0]
         self.sector_size = 1 << self.sector_shift
         self.mini_sector_size = 1 << self.mini_sector_shift
 
-        self.num_fat_sectors = struct.unpack_from("<I", self.data, 0x2C)[0]
         self.first_dir_sector = struct.unpack_from("<I", self.data, 0x30)[0]
         self.mini_stream_cutoff = struct.unpack_from("<I", self.data, 0x38)[0]
         self.first_mini_fat_sector = struct.unpack_from("<I", self.data, 0x3C)[0]
-        self.num_mini_fat_sectors = struct.unpack_from("<I", self.data, 0x40)[0]
         self.first_difat_sector = struct.unpack_from("<I", self.data, 0x44)[0]
         self.num_difat_sectors = struct.unpack_from("<I", self.data, 0x48)[0]
 
@@ -173,13 +170,8 @@ class CompoundFile:
         current = start_sector
 
         while current not in (FREE_SECTOR, END_OF_CHAIN):
-            if current >= len(table):
+            if current >= len(table) or current in seen or len(chain) >= limit:
                 break
-            if current in seen:
-                break
-            if len(chain) >= limit:
-                break
-
             seen.add(current)
             chain.append(current)
             current = table[current]
@@ -188,9 +180,6 @@ class CompoundFile:
 
     def _sector_offset(self, sector_id: int) -> int:
         return (sector_id + 1) * self.sector_size
-
-    def stream_entries(self) -> list[DirectoryEntry]:
-        return [entry for entry in self.directory_entries if entry.object_type == 2]
 
     def stream_entry(self, name: str) -> DirectoryEntry | None:
         return self._stream_by_name.get(name)
@@ -227,17 +216,7 @@ class CompoundFile:
         return bytes(out[:target_bytes])
 
 
-def human_size(size: int) -> str:
-    units = ["B", "KB", "MB", "GB", "TB"]
-    value = float(size)
-    for unit in units:
-        if value < 1024 or unit == units[-1]:
-            return f"{value:.2f} {unit}" if unit != "B" else f"{int(value)} B"
-        value /= 1024
-    return f"{size} B"
-
-
-def extract_utf16_chunks(blob: bytes, min_chars: int = 4, max_chunks: int = 5000) -> list[str]:
+def extract_utf16_chunks(blob: bytes, min_chars: int = 3, max_chunks: int = 10000) -> list[str]:
     pattern = re.compile(rb"(?:[\x20-\x7e]\x00){" + str(min_chars).encode("ascii") + rb",}")
     chunks: list[str] = []
 
@@ -271,181 +250,191 @@ def parse_epoch_ms(value: str | None) -> str | None:
     return f"{dt_local.isoformat()} (local), {dt_utc.isoformat()} (UTC)"
 
 
-def as_float(value: str | None) -> float | None:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except ValueError:
-        return None
+def parse_assets_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
-def as_int(value: str | None) -> int | None:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        return None
+def normalize_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
 
 
-def summarize_tak(path: Path, channels_scan_bytes: int) -> str:
-    cfb = CompoundFile(path)
-    lines: list[str] = []
+def detect_6dof(cfb: CompoundFile, assets: list[str], channels_scan_bytes: int) -> dict[str, object]:
+    channels = cfb.stream_entry("Channels.dat")
+    if channels is None:
+        return {
+            "available": False,
+            "reason": "Channels.dat not found",
+            "per_asset": {},
+            "global_translation": False,
+            "global_rotation": False,
+            "scan_bytes": 0,
+        }
 
-    lines.append(f"File: {path}")
-    lines.append(f"Size: {human_size(path.stat().st_size)}")
-    lines.append(
-        "Container: Compound File Binary "
-        f"(major={cfb.major_version}, minor={cfb.minor_version}, "
-        f"sector={cfb.sector_size}, mini_sector={cfb.mini_sector_size})"
+    blob = cfb.read_stream("Channels.dat", max_bytes=channels_scan_bytes)
+    channel_text = "\n".join(extract_utf16_chunks(blob, min_chars=3))
+    lower = channel_text.lower()
+
+    # Keep broad token matching to support different exporter label variants.
+    global_translation = bool(
+        re.search(r"\btranslation\b|\bposition\b|\bpos[xyz]\b|\btx\b|\bty\b|\btz\b", lower)
+    )
+    global_rotation = bool(
+        re.search(r"\brotation\b|\borientation\b|\bquat(?:ernion)?\b|\bqw\b|\bqx\b|\bqy\b|\bqz\b", lower)
     )
 
-    streams = sorted(cfb.stream_entries(), key=lambda e: e.size, reverse=True)
-    lines.append("")
-    lines.append("Streams:")
-    for entry in streams:
-        lines.append(f"  - {entry.name}: {human_size(entry.size)}")
+    per_asset: dict[str, dict[str, bool]] = {}
+    for asset in assets:
+        n_asset = normalize_text(asset)
+        has_match = False
+        has_translation = False
+        has_rotation = False
+        for chunk in channel_text.splitlines():
+            n_chunk = normalize_text(chunk)
+            if n_asset and n_asset in n_chunk:
+                has_match = True
+                chunk_lower = chunk.lower()
+                if re.search(r"\btranslation\b|\bposition\b|\bpos[xyz]\b|\btx\b|\bty\b|\btz\b", chunk_lower):
+                    has_translation = True
+                if re.search(
+                    r"\brotation\b|\borientation\b|\bquat(?:ernion)?\b|\bqw\b|\bqx\b|\bqy\b|\bqz\b",
+                    chunk_lower,
+                ):
+                    has_rotation = True
+                if has_translation and has_rotation:
+                    break
+        per_asset[asset] = {
+            "present_in_channels": has_match,
+            "translation": has_translation,
+            "rotation": has_rotation,
+            "has_6dof": has_translation and has_rotation,
+        }
 
+    return {
+        "available": True,
+        "reason": "",
+        "per_asset": per_asset,
+        "global_translation": global_translation,
+        "global_rotation": global_rotation,
+        "scan_bytes": len(blob),
+    }
+
+
+def summarize_metadata(path: Path, channels_scan_bytes: int) -> str:
+    cfb = CompoundFile(path)
     meta = cfb.stream_entry("MetaData.dat")
-    metadata_props: dict[str, str] = {}
-    if meta is not None:
-        meta_blob = cfb.read_stream("MetaData.dat")
-        meta_text = "\n".join(extract_utf16_chunks(meta_blob, min_chars=3))
-        metadata_props = parse_property_pairs(meta_text)
+    if meta is None:
+        return "MetaData.dat was not found in this .tak file."
+
+    meta_blob = cfb.read_stream("MetaData.dat")
+    meta_text = "\n".join(extract_utf16_chunks(meta_blob, min_chars=3))
+    metadata_props = parse_property_pairs(meta_text)
+
+    lines: list[str] = []
+    lines.append(f"File: {path}")
+    lines.append("MetaData only")
+    lines.append("")
+
+    if not metadata_props:
+        lines.append("No parseable <property name=... value=...> pairs found in MetaData.dat")
+        return "\n".join(lines)
+
+    lines.append("Available metadata fields:")
+    for key in sorted(metadata_props):
+        lines.append(f"  - {key}")
 
     lines.append("")
-    lines.append("Take Summary:")
+    lines.append("Metadata values:")
+    for key in sorted(metadata_props):
+        lines.append(f"  - {key}: {metadata_props[key]}")
 
-    if metadata_props:
-        take_name = metadata_props.get("TakeName")
-        frame_rate = as_float(metadata_props.get("FrameRate"))
-        start_frame = as_int(metadata_props.get("StartFrame"))
-        end_frame = as_int(metadata_props.get("EndFrame"))
-        start_time = as_float(metadata_props.get("StartTime"))
-        end_time = as_float(metadata_props.get("EndTime"))
+    assets = parse_assets_list(metadata_props.get("Assets"))
+    pose_info = detect_6dof(cfb, assets, channels_scan_bytes=channels_scan_bytes)
 
-        if take_name:
-            lines.append(f"  - Name: {take_name}")
-        if frame_rate is not None:
-            lines.append(f"  - Frame rate: {frame_rate:.3f} Hz")
-        if start_frame is not None and end_frame is not None:
-            frame_count = max(0, end_frame - start_frame + 1)
-            lines.append(f"  - Frame range: {start_frame}..{end_frame} ({frame_count} frames)")
-        else:
-            frame_count = None
-
-        if start_time is not None and end_time is not None:
-            lines.append(f"  - Time range: {start_time:.6f}s..{end_time:.6f}s ({end_time - start_time:.6f}s)")
-
-        capture_start = parse_epoch_ms(metadata_props.get("CaptureStart"))
-        if capture_start:
-            lines.append(f"  - Capture start: {capture_start}")
-
-        calib_time = parse_epoch_ms(metadata_props.get("CalibrationTime"))
-        if calib_time:
-            lines.append(f"  - Calibration time: {calib_time}")
-
-        if frame_rate and frame_count:
-            derived_duration = frame_count / frame_rate
-            if start_time is not None and end_time is not None:
-                declared_duration = end_time - start_time
-                delta = abs(declared_duration - derived_duration)
+    lines.append("")
+    lines.append("6DoF pose check:")
+    if not pose_info["available"]:
+        lines.append(f"  - Verdict: unknown ({pose_info['reason']})")
+    else:
+        global_translation = bool(pose_info["global_translation"])
+        global_rotation = bool(pose_info["global_rotation"])
+        if assets:
+            per_asset = pose_info["per_asset"]
+            assets_with_6dof = [name for name in assets if per_asset[name]["has_6dof"]]
+            if assets_with_6dof:
+                lines.append("  - Verdict: yes, 6DoF evidence found for one or more assets")
+            elif global_translation and global_rotation:
                 lines.append(
-                    "  - Duration check: "
-                    f"declared {declared_duration:.6f}s vs frames/fps {derived_duration:.6f}s "
-                    f"(delta {delta:.6f}s)"
+                    "  - Verdict: likely yes (rotation+translation labels found globally, "
+                    "but not linked to specific asset names)"
                 )
             else:
-                lines.append(f"  - Derived duration: {derived_duration:.6f}s")
+                lines.append("  - Verdict: no clear 6DoF evidence in scanned Channels.dat text")
 
-        assets = metadata_props.get("Assets")
-        if assets:
-            lines.append(f"  - Assets: {assets}")
-    else:
-        lines.append("  - Could not parse MetaData.dat properties")
-
-    nodes = cfb.stream_entry("Nodes.dat")
-    if nodes is not None:
-        nodes_blob = cfb.read_stream("Nodes.dat")
-        nodes_text = "\n".join(extract_utf16_chunks(nodes_blob, min_chars=3))
-
-        marker_names = sorted(set(re.findall(r"\bMarker\d+\b", nodes_text)))
-        camera_labels = sorted(set(re.findall(r"PrimeX[^\"\r\n<]*#\d+", nodes_text)))
-        if not camera_labels:
-            camera_labels = sorted(set(re.findall(r"PrimeX[^\"\r\n<]*", nodes_text)))
-
-        lines.append("")
-        lines.append("Node Summary:")
-        lines.append(f"  - Markers detected: {len(marker_names)}")
-        if marker_names:
-            preview = ", ".join(marker_names[:12])
-            suffix = " ..." if len(marker_names) > 12 else ""
-            lines.append(f"  - Marker names: {preview}{suffix}")
-
-        if camera_labels:
-            lines.append(f"  - Cameras detected: {len(camera_labels)}")
-            for label in camera_labels[:8]:
-                lines.append(f"    - {label}")
-        else:
-            lines.append("  - Cameras detected: 0 (or not found in Nodes.dat text)")
-
-    channels = cfb.stream_entry("Channels.dat")
-    if channels is not None:
-        channel_blob = cfb.read_stream("Channels.dat", max_bytes=channels_scan_bytes)
-        channel_text = "\n".join(extract_utf16_chunks(channel_blob, min_chars=3))
-
-        channel_tokens = sorted(
-            set(
-                re.findall(
-                    r"\b(?:[A-Za-z][A-Za-z0-9_]*Channel|Rotation|Translation|MarkerError)\b",
-                    channel_text,
-                )
+            lines.append(
+                f"  - Channels scan size: {pose_info['scan_bytes']} bytes "
+                f"(requested {channels_scan_bytes} bytes)"
             )
-        )
-
-        lines.append("")
-        lines.append("Channel Summary:")
-        lines.append(f"  - Scan bytes: {human_size(min(channels.size, channels_scan_bytes))}")
-        if channel_tokens:
-            lines.append(f"  - Channel/value types: {', '.join(channel_tokens)}")
+            lines.append(f"  - Global translation labels present: {global_translation}")
+            lines.append(f"  - Global rotation labels present: {global_rotation}")
+            lines.append("  - Per-asset evidence:")
+            for asset in assets:
+                item = per_asset[asset]
+                lines.append(
+                    "    - "
+                    f"{asset}: present={item['present_in_channels']}, "
+                    f"translation={item['translation']}, rotation={item['rotation']}, "
+                    f"has_6dof={item['has_6dof']}"
+                )
         else:
-            lines.append("  - No recognizable channel labels found in scan")
+            if global_translation and global_rotation:
+                lines.append("  - Verdict: likely yes (global rotation+translation labels found)")
+            else:
+                lines.append("  - Verdict: unknown (no assets in metadata and weak channel labels)")
+            lines.append(
+                f"  - Channels scan size: {pose_info['scan_bytes']} bytes "
+                f"(requested {channels_scan_bytes} bytes)"
+            )
+            lines.append(f"  - Global translation labels present: {global_translation}")
+            lines.append(f"  - Global rotation labels present: {global_rotation}")
 
-    track_entries = [entry for entry in streams if entry.name.lower().startswith("track ")]
-    if track_entries:
+    capture_start = parse_epoch_ms(metadata_props.get("CaptureStart"))
+    calibration_time = parse_epoch_ms(metadata_props.get("CalibrationTime"))
+
+    if capture_start or calibration_time:
         lines.append("")
-        lines.append("Track Streams:")
-        for entry in track_entries:
-            lines.append(f"  - {entry.name}: {human_size(entry.size)}")
-
-        end_frame = as_int(metadata_props.get("EndFrame"))
-        start_frame = as_int(metadata_props.get("StartFrame"))
-        if end_frame is not None and start_frame is not None:
-            total_frames = max(0, end_frame - start_frame + 1)
-            if total_frames > 0:
-                largest = max(track_entries, key=lambda e: e.size)
-                bytes_per_frame = largest.size / total_frames
-                if math.isfinite(bytes_per_frame):
-                    lines.append(
-                        f"  - Approx bytes/frame in {largest.name}: {bytes_per_frame:.2f}"
-                    )
+        lines.append("Derived timestamps:")
+        if capture_start:
+            lines.append(f"  - CaptureStart: {capture_start}")
+        if calibration_time:
+            lines.append(f"  - CalibrationTime: {calibration_time}")
 
     return "\n".join(lines)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Read a .tak motion capture file and print summarized information."
+        description="Read a .tak motion capture file, print metadata, and report 6DoF evidence."
     )
     parser.add_argument("tak_file", type=Path, help="Path to .tak file")
     parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Output .txt path (default: <tak_file_stem>_metadata.txt next to input)",
+    )
+    parser.add_argument(
         "--channels-scan-mb",
         type=int,
-        default=4,
-        help="How many MB from Channels.dat to scan for text labels (default: 4)",
+        default=8,
+        help="How many MB from Channels.dat to scan for 6DoF labels (default: 8)",
     )
     return parser
+
+
+def default_output_path(tak_path: Path) -> Path:
+    return tak_path.with_name(f"{tak_path.stem}_metadata.txt")
 
 
 def main() -> int:
@@ -459,13 +448,23 @@ def main() -> int:
     if tak_path.suffix.lower() != ".tak":
         print(f"Warning: expected .tak file, got: {tak_path.name}")
 
+    output_path = (
+        args.output.expanduser().resolve() if args.output is not None else default_output_path(tak_path)
+    )
+
     try:
-        summary = summarize_tak(tak_path, channels_scan_bytes=max(1, args.channels_scan_mb) * 1024 * 1024)
+        summary = summarize_metadata(
+            tak_path,
+            channels_scan_bytes=max(1, args.channels_scan_mb) * 1024 * 1024,
+        )
+        output_path.write_text(summary + "\n", encoding="utf-8")
     except Exception as exc:  # noqa: BLE001 - keep CLI failure friendly
         print(f"Error reading {tak_path}: {exc}")
         return 1
 
     print(summary)
+    print("")
+    print(f"Saved metadata report to: {output_path}")
     return 0
 
 
