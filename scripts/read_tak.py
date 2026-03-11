@@ -9,6 +9,7 @@ writes the same report to a text file for downstream analysis.
 from __future__ import annotations
 
 import argparse
+import csv
 import re
 import struct
 from dataclasses import dataclass
@@ -256,8 +257,170 @@ def parse_assets_list(value: str | None) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def infer_frame_count(metadata_props: dict[str, str]) -> int | None:
+    frame_key_pairs = [
+        ("WorkingStartFrame", "WorkingEndFrame"),
+        ("StartFrame", "EndFrame"),
+    ]
+
+    for start_key, end_key in frame_key_pairs:
+        start_raw = metadata_props.get(start_key)
+        end_raw = metadata_props.get(end_key)
+        if start_raw is None or end_raw is None:
+            continue
+        try:
+            start = int(start_raw)
+            end = int(end_raw)
+        except ValueError:
+            continue
+        if end >= start:
+            return end - start + 1
+    return None
+
+
+def infer_rigidbody_names(assets: list[str], inferred_columns: list[str]) -> list[str]:
+    rigid_names: list[str] = []
+    for name in assets:
+        required = {f"{name}.tx", f"{name}.ty", f"{name}.tz", f"{name}.qx", f"{name}.qy", f"{name}.qz", f"{name}.qw"}
+        if required.issubset(set(inferred_columns)):
+            rigid_names.append(name)
+
+    if rigid_names:
+        return rigid_names
+
+    by_prefix: dict[str, set[str]] = {}
+    for column in inferred_columns:
+        if "." not in column:
+            continue
+        prefix, suffix = column.rsplit(".", 1)
+        by_prefix.setdefault(prefix, set()).add(suffix)
+
+    required_suffixes = {"tx", "ty", "tz", "qx", "qy", "qz", "qw"}
+    for prefix in sorted(by_prefix):
+        if required_suffixes.issubset(by_prefix[prefix]):
+            rigid_names.append(prefix)
+    return rigid_names
+
+
+def write_motion_csv_template(
+    output_path: Path,
+    rigid_body_names: list[str],
+    rows: int,
+) -> None:
+    headers: list[str] = []
+    for name in rigid_body_names:
+        headers.extend([f"{name}.tx", f"{name}.ty", f"{name}.tz", f"{name}.qx", f"{name}.qy", f"{name}.qz", f"{name}.qw"])
+
+    with output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(headers)
+        for _ in range(max(1, rows)):
+            row: list[float] = []
+            for _name in rigid_body_names:
+                row.extend([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+            writer.writerow(row)
+
+
 def normalize_text(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def extract_marker_names(cfb: CompoundFile) -> list[str]:
+    nodes = cfb.stream_entry("Nodes.dat")
+    if nodes is None:
+        return []
+
+    nodes_blob = cfb.read_stream("Nodes.dat")
+    nodes_text = "\n".join(extract_utf16_chunks(nodes_blob, min_chars=3, max_chunks=200_000))
+    names = re.findall(r'"name":\s*"NodeName"\s*,\s*"value":\s*"(Marker\d+)"', nodes_text)
+
+    try:
+        return sorted(set(names), key=lambda name: int(name.replace("Marker", "")))
+    except ValueError:
+        return sorted(set(names))
+
+
+def infer_data_columns(
+    cfb: CompoundFile,
+    assets: list[str],
+    marker_names: list[str],
+) -> dict[str, object]:
+    channels = cfb.stream_entry("Channels.dat")
+    if channels is None:
+        return {
+            "available": False,
+            "reason": "Channels.dat not found",
+            "columns": [],
+            "scan_bytes": 0,
+            "rigid_bodies": 0,
+            "markers": 0,
+        }
+
+    blob = cfb.read_stream("Channels.dat")
+    channel_text = extract_utf16_chunks(blob, min_chars=3, max_chunks=300_000)
+    semantics = [token for token in channel_text if token in {"Translation", "Rotation", "MarkerError"}]
+    if not semantics:
+        return {
+            "available": False,
+            "reason": "No channel semantic labels found in scanned Channels.dat",
+            "columns": [],
+            "scan_bytes": len(blob),
+            "rigid_bodies": 0,
+            "markers": 0,
+        }
+
+    columns: list[str] = []
+    rigid_body_index = 0
+    marker_index = 0
+
+    i = 0
+    while i < len(semantics):
+        # Most OptiTrack TAKs encode rigid body channels as:
+        # Translation (xyz), Rotation (quat), MarkerError (float).
+        if i + 2 < len(semantics) and semantics[i : i + 3] == ["Translation", "Rotation", "MarkerError"]:
+            name = assets[rigid_body_index] if rigid_body_index < len(assets) else f"RigidBody{rigid_body_index + 1}"
+            columns.extend(
+                [
+                    f"{name}.tx",
+                    f"{name}.ty",
+                    f"{name}.tz",
+                    f"{name}.qx",
+                    f"{name}.qy",
+                    f"{name}.qz",
+                    f"{name}.qw",
+                    f"{name}.marker_error",
+                ]
+            )
+            rigid_body_index += 1
+            i += 3
+            continue
+
+        token = semantics[i]
+        if token == "Translation":
+            marker_name = (
+                marker_names[marker_index] if marker_index < len(marker_names) else f"Marker{marker_index + 1:03d}"
+            )
+            columns.extend([f"{marker_name}.x", f"{marker_name}.y", f"{marker_name}.z"])
+            marker_index += 1
+        elif token == "Rotation":
+            name = assets[rigid_body_index] if rigid_body_index < len(assets) else f"RigidBody{rigid_body_index + 1}"
+            columns.extend([f"{name}.qx", f"{name}.qy", f"{name}.qz", f"{name}.qw"])
+        elif token == "MarkerError":
+            if assets and rigid_body_index > 0:
+                name = assets[min(rigid_body_index - 1, len(assets) - 1)]
+            else:
+                name = f"RigidBody{max(rigid_body_index, 1)}"
+            columns.append(f"{name}.marker_error")
+        i += 1
+
+    return {
+        "available": True,
+        "reason": "",
+        "columns": columns,
+        "scan_bytes": len(blob),
+        "rigid_bodies": rigid_body_index,
+        "markers": marker_index,
+    }
 
 
 def detect_6dof(cfb: CompoundFile, assets: list[str], channels_scan_bytes: int) -> dict[str, object]:
@@ -321,15 +484,16 @@ def detect_6dof(cfb: CompoundFile, assets: list[str], channels_scan_bytes: int) 
     }
 
 
-def summarize_metadata(path: Path, channels_scan_bytes: int) -> str:
+def summarize_metadata(path: Path, channels_scan_bytes: int) -> tuple[str, dict[str, object]]:
     cfb = CompoundFile(path)
     meta = cfb.stream_entry("MetaData.dat")
     if meta is None:
-        return "MetaData.dat was not found in this .tak file."
+        return "MetaData.dat was not found in this .tak file.", {"rigid_body_names": [], "frame_count": None}
 
     meta_blob = cfb.read_stream("MetaData.dat")
     meta_text = "\n".join(extract_utf16_chunks(meta_blob, min_chars=3))
     metadata_props = parse_property_pairs(meta_text)
+    frame_count = infer_frame_count(metadata_props)
 
     lines: list[str] = []
     lines.append(f"File: {path}")
@@ -338,7 +502,7 @@ def summarize_metadata(path: Path, channels_scan_bytes: int) -> str:
 
     if not metadata_props:
         lines.append("No parseable <property name=... value=...> pairs found in MetaData.dat")
-        return "\n".join(lines)
+        return "\n".join(lines), {"rigid_body_names": [], "frame_count": frame_count}
 
     lines.append("Available metadata fields:")
     for key in sorted(metadata_props):
@@ -351,6 +515,12 @@ def summarize_metadata(path: Path, channels_scan_bytes: int) -> str:
 
     assets = parse_assets_list(metadata_props.get("Assets"))
     pose_info = detect_6dof(cfb, assets, channels_scan_bytes=channels_scan_bytes)
+    marker_names = extract_marker_names(cfb)
+    column_info = infer_data_columns(
+        cfb,
+        assets=assets,
+        marker_names=marker_names,
+    )
 
     lines.append("")
     lines.append("6DoF pose check:")
@@ -399,6 +569,28 @@ def summarize_metadata(path: Path, channels_scan_bytes: int) -> str:
             lines.append(f"  - Global translation labels present: {global_translation}")
             lines.append(f"  - Global rotation labels present: {global_rotation}")
 
+    lines.append("")
+    lines.append("Inferred data columns:")
+    if not column_info["available"]:
+        lines.append(f"  - unavailable ({column_info['reason']})")
+    else:
+        lines.append(
+            f"  - Channels bytes parsed for column inference: {column_info['scan_bytes']} bytes "
+            "(full stream)"
+        )
+        lines.append(f"  - Inferred rigid-body channel groups: {column_info['rigid_bodies']}")
+        lines.append(f"  - Inferred marker translation channels: {column_info['markers']}")
+        if marker_names:
+            lines.append(f"  - Marker names found in Nodes.dat: {len(marker_names)}")
+        if frame_count is not None:
+            lines.append(f"  - Values per scalar column: {frame_count}")
+        lines.append(f"  - Total scalar columns: {len(column_info['columns'])}")
+        for column in column_info["columns"]:
+            if frame_count is None:
+                lines.append(f"    - {column}")
+            else:
+                lines.append(f"    - {column} ({frame_count} values)")
+
     capture_start = parse_epoch_ms(metadata_props.get("CaptureStart"))
     calibration_time = parse_epoch_ms(metadata_props.get("CalibrationTime"))
 
@@ -410,7 +602,8 @@ def summarize_metadata(path: Path, channels_scan_bytes: int) -> str:
         if calibration_time:
             lines.append(f"  - CalibrationTime: {calibration_time}")
 
-    return "\n".join(lines)
+    rigid_body_names = infer_rigidbody_names(assets, column_info["columns"])
+    return "\n".join(lines), {"rigid_body_names": rigid_body_names, "frame_count": frame_count}
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -430,11 +623,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=8,
         help="How many MB from Channels.dat to scan for 6DoF labels (default: 8)",
     )
+    parser.add_argument(
+        "--motion-csv-output",
+        type=Path,
+        default=None,
+        help="Path for generated rigid-body motion CSV template (default: <tak_file_stem>_rigid_body_motion.csv)",
+    )
+    parser.add_argument(
+        "--motion-csv-rows",
+        type=int,
+        default=1,
+        help="How many rows to write in generated motion CSV template (default: 1)",
+    )
+    parser.add_argument(
+        "--no-motion-csv",
+        action="store_true",
+        help="Skip writing the rigid-body motion CSV template.",
+    )
     return parser
 
 
 def default_output_path(tak_path: Path) -> Path:
     return tak_path.with_name(f"{tak_path.stem}_metadata.txt")
+
+
+def default_motion_csv_path(tak_path: Path) -> Path:
+    return tak_path.with_name(f"{tak_path.stem}_rigid_body_motion.csv")
 
 
 def main() -> int:
@@ -451,13 +665,29 @@ def main() -> int:
     output_path = (
         args.output.expanduser().resolve() if args.output is not None else default_output_path(tak_path)
     )
+    motion_csv_output = (
+        args.motion_csv_output.expanduser().resolve()
+        if args.motion_csv_output is not None
+        else default_motion_csv_path(tak_path)
+    )
 
     try:
-        summary = summarize_metadata(
+        summary, export_info = summarize_metadata(
             tak_path,
             channels_scan_bytes=max(1, args.channels_scan_mb) * 1024 * 1024,
         )
         output_path.write_text(summary + "\n", encoding="utf-8")
+
+        if not args.no_motion_csv:
+            rigid_body_names = list(export_info["rigid_body_names"])
+            if rigid_body_names:
+                write_motion_csv_template(
+                    output_path=motion_csv_output,
+                    rigid_body_names=rigid_body_names,
+                    rows=max(1, args.motion_csv_rows),
+                )
+            else:
+                print("Warning: no rigid-body channels inferred; skipping motion CSV template generation.")
     except Exception as exc:  # noqa: BLE001 - keep CLI failure friendly
         print(f"Error reading {tak_path}: {exc}")
         return 1
@@ -465,6 +695,11 @@ def main() -> int:
     print(summary)
     print("")
     print(f"Saved metadata report to: {output_path}")
+    if not args.no_motion_csv and motion_csv_output.exists():
+        print(
+            f"Saved rigid-body motion CSV template to: {motion_csv_output} "
+            "(placeholder static pose; direct Track*.trk decoding not implemented)"
+        )
     return 0
 
 
